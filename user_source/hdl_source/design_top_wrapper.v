@@ -78,6 +78,14 @@ module design_top_wrapper (
 	wire        	S_raw10_frame_end;   
 	wire        	S_raw10_valid;       
 	wire [39:0] 	S_raw10_data;
+
+	// LSC 镜头色彩阴影校正（v6.1 新增）：接在 RAW10 解包（已含 BLC）之后、
+	// uial2axis 打包之前。治"中间偏绿、四周发紫"——该色偏随半径变化，
+	// AWB（全局增益）与 CCM（全局矩阵）都修不了，只能像素级径向校正。
+	wire        	S_lsc_frame_start;
+	wire        	S_lsc_frame_end;
+	wire        	S_lsc_valid;
+	wire [39:0] 	S_lsc_data;
 		
 	wire 			S_axis_tlast;  
 	wire 			S_axis_tuser;  
@@ -217,6 +225,8 @@ module design_top_wrapper (
     wire [23:0] S_rgb_sobel;       //Sobel边缘输出
     wire [23:0] S_video_sat;       // 饱和度增强后的像素（仅彩色原图模式使用）
     wire [23:0] S_video_dn;        // 色度降噪后的像素（仅彩色原图模式使用）
+    wire [23:0] S_video_enh;       // ★v6.3 画质增强(亮度降噪+锐化)后的像素（仅彩色通路）
+    wire        S_video_enh_de;    // ★v6.5 与 S_video_enh 严格对齐、且消隐期为低的 de（image_enhance 输出）
 
     //===== 自动曝光 AE 测光信号 =====
     wire [7:0]  S_ae_y_avg;        // 帧平均亮度（74.25MHz 域，更新后保持整帧）
@@ -474,6 +484,33 @@ module design_top_wrapper (
         .rgb_out(S_video_bright)
     );
 
+    //0.55 ★v6.3 画质增强：亮度域「边缘保护降噪 + Unsharp 锐化」
+    //     目的：①解决高增益下亮度域噪点（chroma_denoise 只管色度，亮度无人管）
+    //           ②解决画面发糊（原链路全程无锐化，demosaic 双线性本就偏软）
+    //     原理：3×3 高斯低通得 blur；detail=Yc-blur 做软阈值 coring 消噪；
+    //           再按 SHARP_SH 放大残余细节做锐化；delta 叠加回 RGB 保持色相。
+    //     位置：gamma 之后、chroma_denoise 之前（后续色度模块工作在干净亮度上）
+    //     延时：1 行 + 若干拍（与 chroma_denoise 同量级），仅彩色通路，灰度不受影响
+    //     A/B：上板把 MODE 改 0(直通)/1(仅降噪)/2(降噪+锐化，默认) 逐一切换对比
+    //     资源：3 个行 RAM(16/16/24bit)≈4 ERAM，无乘法器
+    image_enhance #(
+        .IMG_WIDTH (1280 ),   // 必须与视频时序行像素数一致
+        .ADDR_W    (12   ),
+        .CORE_DZ   (8'd8 ),   // ADAPT_EN=0 时才生效的常量死区
+        .SHARP_SH  (3'd1 ),   // 锐化右移：1=0.5x(默认) 2=0.25x 3=0.125x
+        .MODE      (2'd2 ),   // 0:直通 1:仅降噪 2:降噪+锐化
+        .EN        (1'b1 ),   // 1:启用；0:退化为直通（保留延时，便于严格 A/B）
+        .ADAPT_EN  (1'b1 )    // ★v6.4：1=降噪强度随 AE 增益自适应（4/6/9/12/16/20/24 七档）
+    ) u_image_enhance(
+        .clk    (S_hdmi_pixel_clk),
+        .rst_n  (S_hdmi_rst_n),
+        .I_de   (S_hdmi_de),
+        .I_ag   (S_ag        ),   // ★v6.4：AE 增益控制字（24MHz 域，模块内做 3 级同步）
+        .rgb_in (S_video_bright),
+        .rgb_out(S_video_enh),
+        .O_de   (S_video_enh_de)  // ★v6.4：与 S_video_enh 严格对齐的 de
+    );
+
     //0.6 色度降噪（Gamma 之后、饱和度之前）
     //    目的：消除高增益（63x）带来的**彩色噪点**
     //    原理：转 YCbCr 后只对色度 Cb/Cr 做 3×3 可分离低通，亮度 Y 完全不动
@@ -488,8 +525,8 @@ module design_top_wrapper (
     ) u_chroma_denoise(
         .clk    (S_hdmi_pixel_clk),
         .rst_n  (S_hdmi_rst_n),
-        .I_de   (S_hdmi_de),        // 必须与 rgb_in 同一拍对齐
-        .rgb_in (S_video_bright),
+        .I_de   (S_video_enh_de),   // ★v6.5：与 rgb_in 严格对齐的 de（消隐期为低，见 image_enhance O_de 注释）
+        .rgb_in (S_video_enh),      // ★v6.3：改为画质增强之后（原为 S_video_bright）
         .rgb_out(S_video_dn)
     );
 
@@ -501,6 +538,8 @@ module design_top_wrapper (
     //    延迟：2 拍（v2 两级流水版，修复 v1 在此处造成的 -1.7ns 时序违例）
     //          仅彩色原图模式受影响，表现为画面右移 1 像素，模式互斥显示不可见
     sat_enhance #(
+        // ★【2026-10-07 诊断结论】sat 曾置 0 做 A/B：置 0 后颜色明显变淡、画面发灰（主观"糊"），
+        //    故恢复 EN=1。实测色度噪声很低（|Δ(R-G)|≈0.94），1.5x 放大后仍可接受。
         .EN       (1     ),   // 1:启用饱和度增强；改 0 可上板做 A/B 对比
         .SAT_GAIN (9'd96 ),   // 色度增益，6位小数定点：64=1.0x 96=1.5x 112=1.75x 128=2.0x
         .DEADZONE (5'd3  )    // 色度死区：|C-Y|≤该值视为灰色不增强（抑制彩色噪点），0=关闭
@@ -621,7 +660,10 @@ module design_top_wrapper (
   
   ae_set #(
       .AUTO_EN    (1      ),   // 1:自动曝光使能；0:关闭自动（按键恢复直接调增益）
-      .TARGET_DEF (8'd120 ),   // 上电靶亮度（v6：112→120，配合 BLC 修复一起上调）
+      .TARGET_DEF (8'd145 ),   // ★v6.4：靶亮度 120→145（120 对应显示域偏暗，用户反馈"和手机差距大"）
+                               //   ⚠【易错点】此处显式传参会【覆盖】ae_set 模块内 TARGET_DEF 的默认值，
+                               //     改靶亮度时两处必须同步；v6.3 只改了模块默认值(145)而此处仍传 120，
+                               //     导致"A 项 120→145"整轮失效 —— 排查画质问题先看这里。
       .WAIT_FRAMES(4'd3   )    // 两次调整间隔帧数（手册要求曝光 N+2 帧生效）
   ) u_ae_set (
       .I_clk(S_24m_clk),
@@ -740,6 +782,46 @@ raw10_unpacket_2lane u_raw10_unpacket (
   );
 
 
+//镜头色彩阴影校正（LSC，v6.1 新增；v6.4 重新标定并启用）
+//位置：BLC 之后、demosaic 之前。BLC 先扣 64，LSC 再乘增益 —— 这样黑电平不会
+//被增益缩放，角落依然是纯黑；同时避免 demosaic 把不同增益的邻域像素插值混在一起。
+//参数 P_R/P_B 为"角落增益增量"（Q8，256=+1.0）：负值 = 衰减角落的 R/B。
+//★【2026-10-07 v6.4 白墙实测重标定】
+//    用"拍屏照片 + R/G、B/G 比值"做径向分析（比值法对亮度暗角免疫，
+//    可剔掉手机镜头暗角与斜视带来的亮度梯度）：
+//      中心 (r<0.25)： R/G = 0.9910   B/G = 0.9778
+//      四角 (r>0.85)： R/G = 1.0109   B/G = 0.9775
+//    ⇒ 空间色偏其实很轻：四角只比中心**红约 2%**，B 基本不动。
+//      显示域 2% → 线性域 ×2.2 ≈ 4.5% ⇒ 角落 R 需衰减 ≈4.5% ⇒ P_R ≈ -12。
+//      旧的 -38（角落 ×0.85，衰减 15%）**大了约 7 倍**，这才是当年
+//      "开 LSC 就偏红 + 噪声×3"的原因（压 R/B 过头 → AE 提增益 → 噪声放大）。
+//    故本次改为 P_R=-12 / P_B=0 并启用（EN=1）。修正量很小（角落 R 仅 -4.7%），
+//    对整体亮度/噪声的影响可忽略，不会再触发 AE 补偿。
+//    上板判据：四角仍偏紫 → P_R 调更负（-16）；四角转绿 → 回调（-8 → -4）。
+//    彻底回退：把 .EN 改回 0（纯 2 拍直通，与 P 值无关）。
+lsc_shading #(
+.IMG_WIDTH   (1280),
+.IMG_HEIGHT  (720 ),
+.BAYER_PHASE (2'd0),      // BGGR（已据 mipi_to_raw_converter 核对）
+.P_R         (-12 ),      // v6.4：角落 R ×0.953（实测标定，原 -38 过大 7 倍）
+.P_G         (0   ),      // G 为基准通道
+.P_B         (0   ),      // v6.4：实测 B/G 无空间梯度，无需校正（原 -38）
+.EN          (1   )       // v6.4：启用（参数已重标定，修正量仅 ~4.7%）
+)
+u_lsc_shading (
+.I_clk        (S_csi_rx_clk        ),
+.I_rst_n      (S_rst_n             ),
+.I_valid      (S_raw10_valid       ),
+.I_frame_start(S_raw10_frame_start ),
+.I_frame_end  (S_raw10_frame_end   ),
+.I_data       (S_raw10_data        ),
+.O_valid      (S_lsc_valid         ),
+.O_frame_start(S_lsc_frame_start   ),
+.O_frame_end  (S_lsc_frame_end     ),
+.O_data       (S_lsc_data          )
+);
+
+
 //将数据转为stream流
 uial2axis #(
 .IMG_WIDTH(1280),
@@ -749,10 +831,11 @@ uial2axis #(
 u_uial2axis (
 .I_native_clk(S_csi_rx_clk),
 .I_rst_n     (S_rst_n),
-.I_data      (S_raw10_data       ),
-.I_data_valid(S_raw10_valid      ),
-.I_data_start(S_raw10_frame_start),
-.I_data_end  (S_raw10_frame_end  ),
+// v6.1：改接 LSC 输出（内部已同步延迟 2 拍，帧起止与数据仍对齐）
+.I_data      (S_lsc_data         ),
+.I_data_valid(S_lsc_valid        ),
+.I_data_start(S_lsc_frame_start  ),
+.I_data_end  (S_lsc_frame_end    ),
 .axis_tvalid (S_axis_tvalid),
 .axis_tdata  (S_axis_tdata ),
 .axis_tuser  (S_axis_tuser ),

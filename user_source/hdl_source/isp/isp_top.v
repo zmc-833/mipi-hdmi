@@ -74,6 +74,44 @@ data128_96 u_data128_96 (
     .O_tdata(m_aixs_tdata_96)
 );
 
+//==============================================================================
+// AWB（v6.2，2026-10-07 替换）
+//------------------------------------------------------------------------------
+// 换成全帧统计版 awb_fix/awb_frame.v，修复旧实现的结构性缺陷：
+//   · 旧版 Σ 在【帧开始】清零后沿帧内滚动累加，除法 start 每拍都发
+//     ⇒ 帧首 ΣR 极小/为 0 时，商撞上"高位非零 ⇒ 限幅 16x"分支，R 被乘 16 倍削顶；
+//   · 旧版数据经 signal_delay 延迟 53 拍、增益只延迟 (2+latency) 拍，二者错位；
+//   · 旧版无合理增益范围限制、无帧间平滑。
+// 实测症状：彩色模式满屏粉红块 + 椒盐噪点，R 通道 5.76% 像素削顶到 ≥250
+//          （G 仅 0.09%），全屏 R/G=1.25。（灰度模式因 R=G=B，对通道比例错误免疫，
+//          所以看不出问题 —— 不要再用灰度画面判断 AWB 是否正常。）
+// 新模块：全帧统计 + 帧末锁存 + 下一帧统一应用 + 限幅[0.5x,2.0x] + 帧间 IIR 平滑。
+// ⚠️ 需在 TD 里把 awb_fix/awb_frame.v 加入工程（新增源文件）。
+// ⚠️ 回退方法：把下面的 awb_frame 换回 awb，并取消下方旧实例的注释即可。
+//==============================================================================
+awb_frame #(
+    .IMG_HEIGHT(720 ),
+    .IMG_WIDTH (1280),
+    .EN        (1'b1     ),      // 1:启用 AWB；0:旁路（增益恒 1.0x，上板 A/B 对比用）
+    .G_MIN     (20'h08000),      // R/B 增益下限 0.50x
+    .G_MAX     (20'h20000)       // R/B 增益上限 2.00x
+) u_awb (
+    .I_clk   (axi4s_video_aclk),
+    .I_rst_n (I_rst_n),
+    .I_tlast (m_aixs_tlast),
+    .I_tuser (m_aixs_tuser),
+    .I_tdata (m_aixs_tdata_96),
+    .I_tvalid(m_aixs_tvalid),
+    .I_tready(m_aixs_tready),
+    .O_tlast (awb_O_tlast ),
+    .O_tuser (awb_O_tuser ),
+    .O_tdata (awb_O_tdata ),
+    .O_tvalid(awb_O_tvalid),
+    .O_tready(awb_O_tready)
+    // O_gain_r / O_gain_b 未接（调试用，可悬空）
+);
+
+/* ===== 旧实现（isp/awb/awb.v，帧内滚动统计版）—— 保留以便一行回退 =====
 awb #(
     .IMG_HEIGHT(720 ),
     .IMG_WIDTH (1280)
@@ -91,6 +129,7 @@ awb #(
     .O_tvalid(awb_O_tvalid),
     .O_tready(awb_O_tready)
 );
+===== 旧实现结束 ===== */
 
     data_96bit_to_128bit u_data_96bit_to_128bit(
         .I_clk              ( axi4s_video_aclk  ),
