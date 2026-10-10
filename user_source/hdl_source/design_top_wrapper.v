@@ -227,6 +227,15 @@ module design_top_wrapper (
     wire        S_coord_hit;       // 坐标 OSD 命中
     wire [23:0] S_coord_color;
 
+    //===== 叠加仲裁（张铭晨 + 张金艺 共用一条进入 hdmi_mixer 的通道）=====
+    //  优先级（高→低）：坐标数字 OSD > 画框/准星 > 检测掩膜
+    //  ★合并张金艺代码时：只把 S_mask_hit / S_mask_color 的驱动源换成 detect 模块输出，
+    //    不要另开 hdmi_mixer 端口 —— 两人改同一个文件必然冲突。
+    wire        S_mask_hit;        // 预留：目标检测掩膜/伪彩（张金艺 D1）
+    wire [23:0] S_mask_color;      // 预留：掩膜颜色
+    wire        S_ovl_hit;         // 仲裁结果 → hdmi_mixer.I_ext_hit
+    wire [23:0] S_ovl_color;       // 仲裁结果 → hdmi_mixer.I_ext_color
+
     //===== 自动曝光 AE 测光信号 =====
     wire [7:0]  S_ae_y_avg;        // 帧平均亮度（74.25MHz 域，更新后保持整帧）
     wire        S_ae_frame_tog;    // 帧握手电平，每帧翻转（跨时钟域用）
@@ -1037,12 +1046,20 @@ isp_top u_isp_top (
         .I_debug_status  ( S_hdmi_debug_status),
         // ★当前显示模式（拨码 SW1/SW2）。S_mode_sel 已在像素时钟域两级同步，
         //   与 hdmi_mixer 同域，直接连线即可，无需再加同步器。
+    // ===== 叠加仲裁：坐标数字 > 画框 > 检测掩膜 =====
+    // TODO(合并张金艺后)：把 S_mask_hit / S_mask_color 接到 detect 模块输出
+    assign S_mask_hit   = 1'b0;
+    assign S_mask_color = 24'h00_FF_00;   // 掩膜默认绿色
+    assign S_ovl_hit    = S_mask_hit | S_box_hit | S_coord_hit;
+    assign S_ovl_color  = S_coord_hit ? S_coord_color :
+                          (S_box_hit  ? S_box_color  : S_mask_color);
+
         .I_mode          ( S_mode_sel         ),
         .I_ae_y          ( S_ae_y_avg         ),   // 预留：帧平均亮度（当前不显示）
         .I_ae_ag         ( S_ag               ),   // AE 增益控制字（OSD 第 2 行）
-        // ★张铭晨：外部叠加（画框优先于坐标 OSD），优先级低于 Logo 与文字 OSD
-        .I_ext_hit       ( S_box_hit || S_coord_hit                ),
-        .I_ext_color     ( S_box_hit ? S_box_color : S_coord_color ),
+        // ★叠加仲裁输出（画框 / 准星 / 坐标 OSD / 检测掩膜），优先级低于 Logo 与文字 OSD
+        .I_ext_hit       ( S_ovl_hit          ),
+        .I_ext_color     ( S_ovl_color        ),
         .O_video_rd_en   ( S_hdmi_window_rd_en),
         .I_video_rd_data ( S_proc_rgb_out  ),
         .O_hdmi_vsync    ( S_hdmi_out_vsync   ),
