@@ -218,6 +218,15 @@ module design_top_wrapper (
     wire [23:0] S_video_sat;       // 饱和度增强后的像素（仅彩色原图模式使用）
     wire [23:0] S_video_dn;        // 色度降噪后的像素（仅彩色原图模式使用）
 
+    //===== 张铭晨 track_box：像素坐标 + 画框 + 坐标 OSD（D1）=====
+    wire [10:0] S_pix_x, S_pix_x_1d, S_pix_x_2d;
+    wire [9:0]  S_pix_y, S_pix_y_1d, S_pix_y_2d;
+    wire        S_frame_done;      // 每帧结束脉冲（消隐期计算用）
+    wire        S_box_hit;         // 画框 / 十字准星命中
+    wire [23:0] S_box_color;
+    wire        S_coord_hit;       // 坐标 OSD 命中
+    wire [23:0] S_coord_color;
+
     //===== 自动曝光 AE 测光信号 =====
     wire [7:0]  S_ae_y_avg;        // 帧平均亮度（74.25MHz 域，更新后保持整帧）
     wire        S_ae_frame_tog;    // 帧握手电平，每帧翻转（跨时钟域用）
@@ -947,6 +956,66 @@ isp_top u_isp_top (
         .O_vtc_last    ( S_hdmi_last      )
     );
 
+    //==================================================================
+    // ★张铭晨 track_box —— D1 交付：画框 + 坐标 OSD（SELF_TEST 固定框）
+    //   目的：上板验证「坐标系统 + 画框对齐」是否正确。
+    //   SELF_TEST=1 ⇒ 画 4 个写死坐标的框 + 白色十字准星（准星在屏心 640,360），
+    //   与左下角 OSD 读数 X:0640 / Y:0360 互相印证。
+    //   D4 起接入张金艺的目标列表：SELF_TEST 改 0，总线接真实检测结果即可。
+    //   注：本段仅在 workbuddy 分支集成，未改动任何原有逻辑。
+    //==================================================================
+    pix_coord_gen #(
+        .H_ACTIVE ( 1280 ),
+        .V_ACTIVE ( 720  )
+    )u_pix_coord_gen(
+        .I_clk        ( S_hdmi_pixel_clk ),
+        .I_rst_n      ( S_hdmi_rst_n     ),
+        .I_de         ( S_hdmi_de        ),
+        .I_last       ( S_hdmi_last      ),
+        .I_vsync      ( S_hdmi_vsync     ),
+        .O_pix_x      ( S_pix_x          ),
+        .O_pix_y      ( S_pix_y          ),
+        .O_pix_x_1d   ( S_pix_x_1d       ),
+        .O_pix_x_2d   ( S_pix_x_2d       ),
+        .O_pix_y_1d   ( S_pix_y_1d       ),
+        .O_pix_y_2d   ( S_pix_y_2d       ),
+        .O_frame_done ( S_frame_done     )
+    );
+
+    box_draw #(
+        .SELF_TEST ( 1 )
+    )u_box_draw(
+        .I_clk       ( S_hdmi_pixel_clk ),
+        .I_rst_n     ( S_hdmi_rst_n     ),
+        .I_de        ( S_hdmi_de        ),
+        .I_pix_x     ( S_pix_x          ),
+        .I_pix_y     ( S_pix_y          ),
+        .I_box_valid ( 4'b0000          ),   // SELF_TEST=1 时被常量折叠
+        .I_box_xmin  ( 44'd0            ),
+        .I_box_xmax  ( 44'd0            ),
+        .I_box_ymin  ( 40'd0            ),
+        .I_box_ymax  ( 40'd0            ),
+        .I_cross_en  ( 1'b1             ),
+        .I_cross_x   ( 11'd640          ),
+        .I_cross_y   ( 10'd360          ),
+        .O_hit       ( S_box_hit        ),
+        .O_color     ( S_box_color      ),
+        .O_de        (                  )
+    );
+
+    osd_coord u_osd_coord(
+        .I_clk        ( S_hdmi_pixel_clk ),
+        .I_rst_n      ( S_hdmi_rst_n     ),
+        .I_de         ( S_hdmi_de        ),
+        .I_pix_x      ( S_pix_x          ),
+        .I_pix_y      ( S_pix_y          ),
+        .I_x_val      ( 11'd640          ),   // D1 固定显示标定点
+        .I_y_val      ( 10'd360          ),
+        .I_frame_done ( S_frame_done     ),
+        .O_hit        ( S_coord_hit      ),
+        .O_color      ( S_coord_color    )
+    );
+
     hdmi_mixer #(
         .H_OFFSET   ( 0    ),
         .V_OFFSET   ( 0    ),
@@ -971,6 +1040,9 @@ isp_top u_isp_top (
         .I_mode          ( S_mode_sel         ),
         .I_ae_y          ( S_ae_y_avg         ),   // 预留：帧平均亮度（当前不显示）
         .I_ae_ag         ( S_ag               ),   // AE 增益控制字（OSD 第 2 行）
+        // ★张铭晨：外部叠加（画框优先于坐标 OSD），优先级低于 Logo 与文字 OSD
+        .I_ext_hit       ( S_box_hit || S_coord_hit                ),
+        .I_ext_color     ( S_box_hit ? S_box_color : S_coord_color ),
         .O_video_rd_en   ( S_hdmi_window_rd_en),
         .I_video_rd_data ( S_proc_rgb_out  ),
         .O_hdmi_vsync    ( S_hdmi_out_vsync   ),
