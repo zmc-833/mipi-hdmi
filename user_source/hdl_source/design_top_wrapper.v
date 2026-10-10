@@ -1025,6 +1025,15 @@ isp_top u_isp_top (
         .O_color      ( S_coord_color    )
     );
 
+    // ===== 叠加仲裁：坐标数字 > 画框 > 检测掩膜 =====
+    // TODO(合并张金艺后)：把 S_mask_hit / S_mask_color 接到 detect 模块输出
+    // ★连续赋值必须写在模块体内、且在任何模块例化的端口连接列表之外。
+    assign S_mask_hit   = 1'b0;
+    assign S_mask_color = 24'h00_FF_00;   // 掩膜默认绿色
+    assign S_ovl_hit    = S_mask_hit | S_box_hit | S_coord_hit;
+    assign S_ovl_color  = S_coord_hit ? S_coord_color :
+                          (S_box_hit  ? S_box_color  : S_mask_color);
+
     hdmi_mixer #(
         .H_OFFSET   ( 0    ),
         .V_OFFSET   ( 0    ),
@@ -1046,14 +1055,6 @@ isp_top u_isp_top (
         .I_debug_status  ( S_hdmi_debug_status),
         // ★当前显示模式（拨码 SW1/SW2）。S_mode_sel 已在像素时钟域两级同步，
         //   与 hdmi_mixer 同域，直接连线即可，无需再加同步器。
-    // ===== 叠加仲裁：坐标数字 > 画框 > 检测掩膜 =====
-    // TODO(合并张金艺后)：把 S_mask_hit / S_mask_color 接到 detect 模块输出
-    assign S_mask_hit   = 1'b0;
-    assign S_mask_color = 24'h00_FF_00;   // 掩膜默认绿色
-    assign S_ovl_hit    = S_mask_hit | S_box_hit | S_coord_hit;
-    assign S_ovl_color  = S_coord_hit ? S_coord_color :
-                          (S_box_hit  ? S_box_color  : S_mask_color);
-
         .I_mode          ( S_mode_sel         ),
         .I_ae_y          ( S_ae_y_avg         ),   // 预留：帧平均亮度（当前不显示）
         .I_ae_ag         ( S_ag               ),   // AE 增益控制字（OSD 第 2 行）
